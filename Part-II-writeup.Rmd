@@ -1,0 +1,637 @@
+---
+title: "Final Project Part II"
+author: "Team_FP04"
+date: "12/13/2019"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r library, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(GGally)
+library(ggpubr)
+library(corrplot)
+library(ggthemes)
+library(knitr)
+library(texreg)
+library(BAS)
+```
+
+
+```{r read-data, include=FALSE}
+load("paintings_train.Rdata")
+load("paintings_test.Rdata")
+load("paintings_validation.RData")
+```
+
+## **Introduction**
+
+<!--- 1. Introduction (1 point if improved from before)
+  add previous intro with any edits --->
+  
+  The 18th century is often refered to as "le siècle, des Lumières" (the century of the lights) in reference to the philosophers that emerged early on the 1700s leading the way towards the French Revolution. In addition to its important societal evolutions, the 18th century was also a major period for art in France and it is therefore of interest to understand painting trading during that period, especially before the French Revolution (1789).
+
+The aim of our analysis is to explore the factors that drove painting prices in 18th century Paris. The painting prices will be predicted from auction price data between 1764-1780 containing information on the sale (seller/buyer), the artist, and other characteristics of the painting. This analysis will also allow us to assess which paintings were overvalued or undervalued. 
+
+In the first part of the analysis, We first explored the effects of potential predictors and their interactions on painting prices by conducting an Exploratory Data Analysis. This also allowed us to prepare the data for the next phase. We then built a linear model using stepwise regression method with akaike information criterion (AIC) and a training subset to select a robust model predicting the auction price (using the log transformation `logprice`). We finally validated our model on a test subset.
+
+In the second phase of the analysis, we will revisit the linear model and assess its quality of the fit. Given the limitations of the linear model, the results might be improved by an optimization of the bias/variance trade-off. A more thorough EDA will also be considered. We will then explore more complex techniniques to produce a better fitting model that should have better out-of-sample predictions of auction prices. We will consider several different options, including Bayesin Model Aaveraging (BMA), random forests, boosting and Lasso, in order to find the model that performs best on the test data.   
+  
+## **EDA**
+
+<!--_Using EDA and any numerical summaries get to know the data -  identify what you might consider the 10 best variables for predicting `logprice` using scatterplots with other variables represented using colors or symbols, scatterplot matrices or conditioning plots._ -->
+
+<!---2. Exploratory data analysis (1 point if improved from before): 
+   add previous EDA --->
+  
+```{r pre processing, message=FALSE, warning=FALSE, include=FALSE}
+# Data pre-processing
+
+# Organize the variables into continuous/binary/multilevel categorical
+quant_vars <- names(paintings_train)[c(3,5,23:27,29,33)]
+bin_vars <- names(paintings_train)[c(9,15,21,34:59)]
+cat_vars <- names(paintings_train)[c(4,6:8,19,20,22,28,30:32)]
+# The response and useless variables are not organized here
+
+# Function to replace NA values
+# If na_as_level = T, NAs in categorical vars get replaced with mode
+# If na_as_level = F, NA gets changed to a separate level
+impute_NA <- function(df, na_as_level = FALSE) {
+  
+  # For quantitative variables, replace with the mean
+  for (q in setdiff(quant_vars, "Surface")) {
+    if (!(q %in% names(df))) next
+    
+    mean_val <- mean(df[[q]], na.rm = TRUE)
+    replacement <- ifelse(typeof(df[[q]]) == "double",
+                          mean_val, as.integer(mean_val))
+    df[[q]][is.na(df[[q]])] <- replacement
+  }
+  
+  # SPECIAL CASE: Surface is skewed heavily right, so take the median
+  if ("Surface" %in% names(df)) {
+    med_val <- median(df$Surface, na.rm = TRUE)
+    df$Surface[is.na(df$Surface)] <- med_val
+  }
+  
+  # For categorical variables, replace with the mode
+  for (ct in c(cat_vars, bin_vars)) {
+    if (!(ct %in% names(df))) next
+    
+    if (na_as_level) {
+      df[[ct]] <- as.character(df[[ct]])
+      df[[ct]][is.na(df[[ct]])] <- "N/A"
+      df[[ct]] <- as.factor(df[[ct]])
+    }
+    else {
+      freq_tab <- table(df[[ct]])
+      mode_val <- names(freq_tab)[which.max(freq_tab)]
+      df[[ct]][is.na(df[[ct]])] <- mode_val
+    }
+  }
+  
+  return (df)
+}
+
+preprocess <- function(df, rm_dup = TRUE) {
+  
+  # Replacing empty string and n/a with actual NA
+  df[df == ""] <- NA
+  df[df == "n/a"] <- NA
+  
+  # Deleting replicates
+  if (rm_dup) {
+    df <- df %>% distinct()
+  }
+  
+  # Transform the categorical variables to factors
+  for(i in bin_vars) {
+    if (!(i %in% names(df))) next
+    df[,i] <- as.factor(df[,i])
+  }
+  
+  if ("position" %in% names(df)) {
+    df$position <- ifelse(df$position >= 0 & df$position <= 1,
+                          df$position, NA)
+  }
+  # Can only have positive surface - need to adjust, since we take the log
+  if ("Surface" %in% names(df)) {
+    df$Surface <- ifelse(df$Surface <= 0, NA, df$Surface)
+  }
+  if ("Shape" %in% names(df)) {
+    df$Shape <- recode(df$Shape, ovale = "oval", ronde = "round")
+  }
+
+  return (df)
+}
+
+# Save the unprocessed training set for later
+raw_paintings_train <- paintings_train
+paintings_train <- preprocess(paintings_train)
+paintings_test <- preprocess(paintings_test, rm_dup = F)
+paintings_validation <- preprocess(paintings_validation, rm_dup = F)
+```
+
+```{r part 2 extra preprocessing, include=FALSE}
+# part 2 additions
+  quartiles_winningBidder <- paintings_train %>% 
+    group_by(winningbidder) %>% 
+    summarize(logprice = mean(logprice)) %>% 
+    arrange(-logprice) %>% 
+    ungroup %>% 
+    mutate(row = 1:n(),
+           quartiles_winningBidder = as.factor(ntile(logprice, n=4)),
+           highest_winningBidder = row<=10,
+           lowest_winningBidder = row >= n() - 10) %>% 
+    select(winningbidder, quartiles_winningBidder, lowest_winningBidder, highest_winningBidder)
+  
+  quartiles_authors <- paintings_train %>% 
+    group_by(authorstandard) %>% 
+    summarize(logprice = mean(logprice)) %>% 
+    arrange(-logprice) %>% 
+    ungroup %>% 
+    mutate(row = 1:n(),
+           quartiles_authors = as.factor(ntile(logprice, n=4)),
+           highest_authors = row<=10, 
+           lowest_authors = row >= n() - 10) %>% 
+    select(authorstandard, quartiles_authors, lowest_authors, highest_authors)
+  
+add_quartiles <- function(df, quartiles_authors, quartiles_winningBidder) {
+  df <- df %>% 
+    #mutate(year = as.factor(year)) %>% 
+    left_join(quartiles_winningBidder) %>% 
+    left_join(quartiles_authors) %>% 
+    mutate(lowest_authors = replace_na(lowest_authors, F),
+           highest_authors = replace_na(highest_authors, F),
+           highest_winningBidder = replace_na(highest_winningBidder, F),
+           lowest_winningBidder = replace_na(lowest_winningBidder, F),
+           quartiles_winningBidder = replace_na(quartiles_winningBidder, 1),
+           quartiles_authors = replace_na(quartiles_authors, 4))
+}
+
+paintings_train <- add_quartiles(paintings_train, quartiles_authors, quartiles_winningBidder)
+paintings_test <- add_quartiles(paintings_test, quartiles_authors, quartiles_winningBidder)
+paintings_validation <- add_quartiles(paintings_validation, quartiles_authors, quartiles_winningBidder)
+```
+
+
+  We start by exploring variables in the training dataset and understand their meaning. We first implement the required data pre-processing:
+  
+  * transform empty string and "n/a" character to NA
+  * Delete duplicate rows
+  * Transform binary and charcter variables to factors
+  * Change `position` values not bounded from 0 to 1 to NA
+  * Reconcile `Shape` coding (ovale = oval, round = ronde)
+  * Group `authorstandard` and `winningbidder` into quartiles
+  * Impute the missing data
+    
+Imputation: We impute the mean of each quantitative column except Surface (heavily skewed right) for which we impute its median. For the binary and multiple level factor variables, we choose to impute the mode of each column.
+    
+we then see that some variables were used to classify each painting and therefore cannot be used in our analysis:
+`sale`, `lot`, `count`, `subject`, `author`, `subject`, `authorstyle`  
+
+We exclude `authorstandard` and `winningbidder` and keep their quartiles classification. In addition, since we are predicting `logprice`, we will not used variable `price`.  
+
+  We can classify the remaining variables in two different ways, either by the way they are coded (quantitative, dumy, multiple level factors) or by the information they provide (i.e. sale, author, size & material or characteristics). First, we goup variables according to the way they are coded:
+  
+### Quantitative Variables 
+`position`, `year`, `Height_in`, `Width_in`, `Surface_Rect`, `Diam_in`, `Surface_Rnd`, `Surface`, `nfigures`  
+  
+We decide to classify `year` as numeric in the displayed EDA as it is spread around more than twenty years. Using our intuition, we choose to only use  `Surface` and drop `Height_in`, `Width_in`, `Surface_Rect`, `Diam_in` and `Surface_Rnd` as they are extremely correlated and would not necessarily bring any additional information. We might want to later investigate the relationship of `Surface` with other variables such as `Shape` or the type of material. We use a scatterplot matrix to investigate the relationship between these quantitative variables and `logprice` (FIG 1).  
+  
+```{r Quant, echo=FALSE, message=FALSE, warning=FALSE}
+# Quant var plot here 
+# name FIG 1
+ggpairs(paintings_train %>%
+          mutate(logSurface = log(Surface+1)) %>%
+          select(position, year, nfigures, logSurface, logprice),
+        title = "FIG 1: Relationship of relevant quantitative variables"
+)
+```
+  
+    
+    
+We see that the quantitative predictors plotted here are not really correlated with each other. Variable `position` only has a small negative and not necessarily linear correlation with the response variable. `year` has a stronger effect on `logprice` (.26) and we could consider a sort of overall "inflation" on paintings even though it is not linear nor monotonic. `Surface` is also positively correlated with `logprice` (.17). Note here that we used a log transformation on `Surface` in order to make its relationship with `logprice` linear. Finally, variable `nfigures` behave in a strange way. While having no figure does not seem to give any information on `logprice`, we can see that for paintings with at least one figure, more figures is correlated with higher price. It will be interresting to explore the interraction of `nfigures` with some of the binary predictor variables that we explore next.  
+  
+  
+### Binary Variables
+`diff_origin`, `artistliving`, `Interm`, `figures`,`engraved`, `original`, `prevcoll`, `othartist`, `paired`, `finished`, `lrgfont`, `relig`, `landsALL`, `lands_sc`, `lands_elem`, `lands_figs`, `lands_ment`, `arch, mytho`, `peasant`, `othgenre`, `singlefig`, `portrait`, `still_life`, `discauth`, `history`, `allegory`, `pastorale`, `other`  
+  
+We present correlations between all the binary variables and log(price) (FIG 2a). Unsurprisingly, an additional paragraph in a larger font has a high correlation with price, suggesting that these paintings were the highlights in the different auctions. An intermediary also suggests a higher price, maybe because these individuals are involved mostly in high stakes sales. A mention of the previous owner and having a highly polished finishing are also factors that seem to drive up the price. Factors the drive the prices down are different origin of author and painting, if the content of the painting includes a "plain landscape", if the painting is just a "pairing" of another art work, and if the content is still life. 
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+bin_corr <- paintings_train %>% 
+  select(logprice, bin_vars) %>% 
+  mutate_all(.funs = as.numeric) %>% 
+  cor(use ="pairwise.complete.obs")
+
+# corrplot(bin_corr, order = "hclust",  tl.col = "black", tl.cex =0.8)
+
+bin_price <- data.frame(corr = bin_corr[1,],
+                var = row.names(bin_corr)) %>% 
+  arrange(-corr) %>% 
+  filter(var != "logprice") 
+
+ggplot(bin_price, aes(x=reorder(var, corr), y = corr, fill = corr))+
+  geom_bar(stat = "identity")+
+  coord_flip()+scale_fill_gradient2(low="firebrick", high="springgreen4", mid = "lightyellow")+
+  theme_bw()+
+  labs(title = "FIG 2a: Correlations of log(price) with Binary Variables")+
+  ylab("Correlation with log(price)")+
+  xlab("Binary Variables")+theme(legend.position = "none")
+
+```
+
+Once we have an idea of the top binary variable candidates to include in our model, it is important to take a look at their correlations within themselves and with other variables. Fig 2b is a correlation matrix of select binary variables. From this plot, it is clear that there is no need to include more than one variable among `landsALL`, `lands_elem` and `lands_figs` as they are all related in content, highly correlated and have similar effect on prices. `singlefig` is strongly negatively correlated with the above three, and negatively correlated with price, so we should also consider dropping it if we select one of the others. Regarding `lrgfont` and `Interm`, although both of them have a high correlation with prices, they are also correlated with each other, so we might consider choosing one of them.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+bin_vars_subset <- as.character(bin_price$var[c(1:6,11, 24:29)])
+bin_corr_subset <- paintings_train %>% 
+  select(logprice, bin_vars_subset) %>% 
+  mutate_all(.funs = as.numeric) %>% 
+  cor(use ="pairwise.complete.obs")
+
+corrplot(bin_corr_subset, order = "hclust",  tl.col = "black", tl.cex =0.8,
+         title = "FIG 2b: Correlation plot of log(price) and select binary variables",
+         mar = c(0,0,2,0))
+
+```
+
+
+
+
+
+### Multiple Level Factor Variable
+`year`, `origin_author`, `origin_cat`, `school_pntg`, `Shape`, `material`, `mat`, `materialCat`, `dealer`, `winningbiddertype`, `endbuyer`, `type_intermed`  
+  
+We choose here to include quartiles of `winningbidder` and `authorstandar` made in the data preprocessing based on the average buying/selling `logprice` of each winning bidder/ author.  The scale goes from 1 least expensive to 4 most expensive. When investigating the material variable, we decide to exclude `material` as it has too many levels. As it has an important number of NA values, `type_intermed` is also ignored for now but will be considered later for interactions. (FIG 3)   
+  
+```{r multiple lvl, echo=FALSE, message=FALSE, warning=FALSE}
+cat_var_to_plot <- c("origin_author", "origin_cat", "school_pntg", "dealer",  "winningbiddertype", "endbuyer", "quartiles_winningBidder", "quartiles_authors", "Shape", "mat", "materialCat")
+
+r.2 = matrix(NA, 11,1)
+w = 0
+for(i in paintings_train[cat_var_to_plot]){
+w = w+1
+a <- summary(lm(logprice ~ i, data=paintings_train))[["r.squared"]]
+r.2[w] <- a
+}
+r.2 = round(r.2, 3)
+
+# reduce axis size and define margin
+par(cex=.5, mai= c(.1,.1,.1,.1), oma = c(0,0,3,0))
+
+# position and build plots
+par(fig = c(.1,.35,.8,1), new = TRUE)
+boxplot(logprice~origin_author, data = paintings_train, 
+  xlab='origin_author', ylab='logprice', main = paste("origin_author R^2 = ", r.2[1], sep=""))
+par(fig = c(.4,.65,.8,1), new = TRUE)  
+boxplot(logprice~origin_cat, data = paintings_train, 
+  xlab='origin_cat', ylab='logprice', main = paste("origin_cat R^2 = ", 
+                                                   r.2[2], sep=""))
+par(fig = c(.7,.95,.8,1), new = TRUE)
+boxplot(logprice~school_pntg, data = paintings_train, 
+  xlab='school_pntg', ylab='logprice', main = paste("school_pntg R^2 = ", r.2[3], sep=""))
+par(fig = c(.1,.35,.55,.75), new = TRUE)
+boxplot(logprice~dealer, data = paintings_train, 
+  xlab='dealer', ylab='logprice', main= paste(
+    "dealer Vs. logprice R^2 = ", r.2[4], sep=""))
+par(fig = c(.4,.65,.55,.75), new = TRUE)
+boxplot(logprice~winningbiddertype, data = paintings_train, 
+  xlab='winningbiddertype', ylab='logprice', main = 
+    paste("winningbiddertype R^2 = ", r.2[5], sep=""),
+  las=2)
+par(fig = c(.7,.95,.55,.75), new = TRUE)
+boxplot(logprice~endbuyer, data = paintings_train, 
+  xlab='endbuyer', ylab='logprice', main = paste("endbuyer R^2 = ", r.2[6], sep=""))
+par(fig = c(0.1,.35,.3,.5), new = TRUE)
+boxplot(logprice~quartiles_winningBidder, data = paintings_train,
+  xlab='winningbidder', ylab='logprice', main = paste(
+    "winningbidder R^2 = ", r.2[7], sep=""))
+par(fig = c(0.4,.65,.3,.5), new = TRUE)
+boxplot(logprice~quartiles_authors, data = paintings_train, 
+  xlab='authorstandard', ylab='logprice', main = paste(
+    "authorstandard R^2 = ", r.2[8], sep=""))
+par(fig = c(.7,.95,.3,.5), new = TRUE)
+boxplot(logprice~Shape, data = paintings_train, 
+  xlab='Shape', ylab='logprice', main = paste("Shape R^2 = ", r.2[9],
+                                              sep=""), las=2)
+par(fig = c(.1,.35,.05,.25), new = TRUE)
+boxplot(logprice~mat, data = paintings_train, 
+  xlab='mat', ylab='logprice', main = paste("mat R^2 = ", r.2[10],
+                                              sep=""), las = 2)
+par(fig = c(.4,.65,.05,.25), new = TRUE)
+boxplot(logprice~materialCat, data = paintings_train, 
+  xlab='materialCat', ylab='logprice', main = paste(
+    "materialCat R^2 = ", r.2[11], sep=""))
+
+
+#par(fig = c(), new = TRUE)
+#boxplot(logprice~year, data = paintings_train, 
+#  xlab='year', ylab='logprice', main = paste(
+#    "year R^2 = ", r.2[], sep=""))
+
+#par(fig = c(), new = TRUE)
+#boxplot(logprice~year, data = paintings_train, 
+#  xlab='year', ylab='logprice', main = paste(
+#    "year R^2 = ", r.2[], sep=""))
+
+# Text for all plots combined
+mtext("FIG 3: Distribution of log(price) across multilevel factors",
+      line = 0, side = 3, outer = T)
+
+```
+   
+   
+  Using intuition, we could classify the first three plots regarding `origin_author`, `origin_cat` and `school_pntg` as information about the author. We expect these variables to be correlated with each other and therefore only using one of them would most likely give us enough information. We decide here to select `origin_author` as it has the highest r.squared (.15). The next three plots give us information about the sale of each painting. Looking at the `dealer` plot, we see that sale prices seem to be a little different across dealers. This might be explained by the kind of painting they each sale or by the kind of client they reach to. Now focusing on the `winningbiddertype` and `endbuyer` plots, we can deduce that these two variables inform on the buyer and so are probably highly correlated with each other. We can observe some differences accross buyers. We think that an explaination for these differences might be the intervention of intermediaries. Looking at both of our quartiles plots, we see that they provide us with a lot of information about the price of the painting depending on the buyer or the seller. Finally, the last three plots can be categorized as shape and material. These plots only explain an insignificant amount of the variance in `logprice`. However, the effect of a different shape as well as the interaction between the `Shape` and `Surface` might be worth looking at in our model building. Regarding material, the interaction with `Surface` could be of interest.  
+  
+  
+From our EDA, we are able to extract what we consider the 10 most important variables to predict `logprice`. Looking at the quantitative variables `year` and `Surface`, one can see that they are quite strongly correlated with our response variable (r = .26 and .17) and bring information about price evolution across years and accross the overall size of the painting. For the variables giving us information on the author, `diff_origin` has a relatively strong correlation (about .33) with `logprice`. Variables `origin_author`, `origin_cat` and `school_pntg` are correlated with each other and some of their imformation is already carried by `diff_origin`. However, the variable giving us the most information about prices accros authors is our quartiles variables `quartiles_authors` with an r-squared of .58. Therefore, we decide to choose `diff_origin` and `quartiles_authors`. When looking at the sale of the paintings, one can observe that `winningbiddertype` has an r-squared of .21 when regressed on `logprice`. However, we can assume that it will be strongly correlated to `Interm` and therefore would select `endbuyer` (r.sq = .14) instead. Nonetheless, our new variable `quartiles_winningBidder` seems to outperform all of these variables with an r-squarred of .48. Even if it migght be correlated with `quartiles_authors` or `dealer` we still believe it is an important variable. Variable `Interm` (presence of an intermediary) is also quite strongly correlated with the response (about .38). Despite its high correlation with other variables included in this list, we still believe that it provides important information. Finally, when investigating characteristics of paintings, variables `lrgfont` is the one with the highest correlation with the response (>.4) and despite its correlation with `Interm`, we consider it as an important predictor. Variables `lands_sc`, `prevcoll`, `finished` are also considered important in predicting `logprice` with correlations between .15 and .25 and a low correlation with the other variables selected. 
+  
+  Our 10 variables:  
+`lands_sc`, `prevcoll`, `finished`, `lrgfont`, `quartiles_authors`, `quartiles_winningBidder`, `Interm`, `Surface`, `year`, `diff_origin`
+  
+  
+## **Preliminary Model**
+
+<!--- 3. Discussion of preliminary model Part I (5 points)
+Discuss performance based on leader board results and suggested refinements. --->
+
+This discussion is based on how our final model from Part-I should have performed under the test dataset uploaded on December 12th 2019. 
+In part A of the project, we ran stepwise selection on the 10 variables we indentified as important in the Part-I EDA (`lands_sc`, `prevcoll`, `finished`, `lrgfont`, `origin_author`, `endbuyer`, `interm`, `Surface`, `year`, `diff_origin`), along with 10 additional variables (`dealer`, `Shape`, `material_Cat`, `lands_figs`, `peasant`, `engraved`, `portrait`, `still-life`, `discauth`, `artistliving`) and a few interactions (`log(Surface + 1):materialCat`, ` dealer:origin_author`, `dealer:Interm`, `endbuyer:Interm`, `dealer:endbuyer` and `finished:prevcoll`) that looked relevant in the data . The initial model included 77 coefficients, since many of our variables are categorical and were transformed into dummy variables in the regression. After stepwise selection with AIC as the selection criteria and two-directional search, we ended up with 36 coefficients or 19 variables (`lands_figs` was dropped) and one interaction (`finished:prevcoll`). We chose this model as our model for prediction.
+
+Looking back, we first see that our model performed quite well with a coverage of 95.3%, a bias of 234.07 and a RMSE of 1278.16. We could however have gone deeper in the EDA part by for example testing `year` as a factor variable or exploring variables such as `authorstandard` and `winningbidder`. Even though our bias and RMSE are quite low, better variable selection in the initial model would probably have helped us reduce them even more. To remedy this issue, we should have relied more on our EDA and limit the number of variables in our initial model. In order to investigate relevant interaction, we could have ran a stepwise regression on these selected variables with all two way interactions and pick the ones that seemed the most relevant. An other possibility was to use a different criteria for model selection. On the same initial model, running stepwise selection with BIC instead of AIC results in a smaller model with only 24 coefficients. Comparing the two options, BIC has a lower $R^2$ (0.6 compared to 0.614) and a higher residual se (1.19 compared to 1.17). Finally, We could have improved the model using cross validation.
+
+
+## **Development of Final Model**
+
+<!--- 4.  Development of the final model (20 points)
+
+* Final model: must include a summary table
+
+* Variables: must include an explanation
+
+* Variable selection/shrinkage: must use appropriate method and include an explanation
+
+* Residual: must include a residual plot and a discussion
+
+* discussion of how prediction intervals obtained --->
+
+From what we learned from the first part, we decide to pick a more restricted set of variables for our initial model. Using k-fold cross validation with k=5, we try different selections including the variables present in our model from Part-I as well as year as factor and our two quartiles variables. We realize however, that despite a better RMSE in the painting_test dataset year as a factor seem to add instability in the model that we can observe through k-fold cross validation. Regarding the quartiles, they seem to reduce our out-of-sample performance consistently. We therefore end-up with a subset of 15 variables that we used in our model in Part-I (`log(Surface)`, `year`, `Interm`, `engraved`, `prevcoll`, `finished`, `lrgfont`, `lands_sc`, `portrait`, `still_life`, `discauth`, `artistliving`, `dealer`, `origin_author` and `materialCat`). In order to investigate potential interactions, we run a backwards stepwise regression with AIC as selection criteria on our selected variables with all two way interactions. From this stepwise model, we pick the interactions that seem the most relevant
+(`year:discauth`, `year:artistliving`, `Interm:discauth`, `Interm:dealer`, `prevcoll:finished`and `discauth:dealer`).  
+
+
+From this initial model, we choose to use BMA to produce our final model for this task. The advantages of using BMA are that it tends to perform better in terms of out-of-sample prediction compared to single-model techniques. It accounts for out-of-sample uncertainty and includes a version of selection by shrinking unnecessary coefficients towards zero. Markov Chain Monte-Carlo used in this analysis also avoid to enumerate every model and focuses on the one with higher probabilities.
+
+Since we want to restrict the model to only the most important variables, we feel it is better to go with a more complex technique that will perform another kind of variable selection and reduce the tendency of linear models to overfit. In addition, BMA seems relevant in this case compared to tree-based techniques since the response is a continuous variable that should be monotonically correlated with the coefficients. Lasso and Ridge were also considered but we decided against them because estimating standard errors is more natural in a BMA setting and show higher out-of-sample RMSE. We use Highest Probability Model as our estimator as, it performed better (lowest test RMSE) than BMA and BPM in cross-validation as it will be shown in the evaluation of the model. Intervals are estimated from the posterior thanks to the `predict.bas` function using the HPM model. It calculates intervals the same way as a linear regression model
+  
+
+```{r subsets used, include=FALSE}
+full_train <- paintings_train %>%
+  # select manually the most important predictors
+  select(logprice, Surface, year,
+         Interm, engraved, prevcoll, finished,
+         lrgfont, lands_sc, portrait, still_life,
+         discauth, artistliving,
+         dealer, origin_author, materialCat)
+```
+
+
+```{r aic selection, include=FALSE}
+full_lm <- lm(logprice ~ (. - Surface + log(Surface))^2, data = full_train)
+aic_lm <- step(full_lm, trace = 0, direction = "backward", k = 2)
+```
+
+
+```{r bma fitting, include=FALSE}
+bma <- bas.lm(logprice ~ . - Surface + log(Surface) +
+                year:discauth + year:artistliving + Interm:discauth + 
+                Interm:dealer + prevcoll:finished + discauth:dealer,
+              data = full_train %>% impute_NA(),
+              prior = "g-prior",
+              alpha = nrow(full_train),
+              modelprior = uniform(),
+              method = "MCMC")
+```
+
+```{r}
+# HPM model extracted from summary
+HPM <- full_train%>% select (logprice, Surface, year,
+         Interm, engraved, prevcoll, finished,
+         lrgfont, lands_sc, portrait, still_life,
+         discauth, artistliving,
+         dealer, origin_author)
+HPM <- lm(logprice~ . + prevcoll:finished, data = HPM)
+
+par(mfrow = c(2,2))
+plot(HPM)
+```
+
+Above are the residual plots for the HPM model. They show that the model meet assumptions for linear regression (equal variance, normal residuals, etc.). We can then pursue with this model. 
+
+```{r bma diagnostics, echo=FALSE}
+par(mfrow = c(2,1))
+diagnostics(bma)
+```
+
+The diagnostics plots for the BMA shows that the models converged. The dots along the diagonal show that the estimates of the marginal inclusion probabilities from the re-normalized posterior odds agree with the estimates based on Monte Carlo frequencies. This means that enough MCMC samples were obtained.
+
+```{r bma coefs, echo=FALSE}
+kable(summary(bma), digits = 3)
+```
+
+```{r bma image, echo=FALSE}
+image(bma, cex.axis = 0.45) 
+```
+
+Both the table and the model space show that the BMA procedure produces clear decisions on what should and what shouldn't be in the model. Out of our candidate variables, several were dropped from all top models. Others got probability of one to be kept in the model.
+
+```{r bma plots, echo=FALSE}
+plot(bma, which = 4)
+```
+
+The Inclusion Probabilities graph is another visualization that helps us understand what the BMA procedure considers should and what shouldn't be kept in the final model. 
+
+## **Assessment of Final Model**
+
+<!--- 5. Assessment of the final model (25 points)
+
+
+* Model evaluation: must include an evaluation discussion
+
+* Model testing : must include a discussion
+
+* Model result: must include a selection and discussion of the top 10 valued paintings in the validation data. --->
+
+### Model Evaluation
+
+```{r summaries}
+coefs <- coef(bma, estimator = "BMA", n.models = 1)
+df <- data.frame("post mean" = coefs$postmean, "post sd" = coefs$postsd, "post P(B != 0)" = coefs$probne0)
+rownames(df) <- coefs$namesx
+kable(df, digits = 4, caption = "Posterior summaries of coefficients in final model")
+
+summ <- summary(bma)
+kable(summ[(nrow(summ)-4):nrow(summ), -1], digits = 4, caption = "Performance of top 5 BMA models")
+```
+
+From the posterior summaries above, we can see that most of the included coefficients have high marginal inclusion probabilities: only `materialCat` is below 0.5.  Contrarily, the interaction terms, which were chosen based on an AIC stepwise selection, are mostly not significant: only `prevcoll:finished` is above 0.5.  Based on the summary table, however, BMA was mostly able to find well-fitted models.  The best model had an $R^2$ of 0.6051 and 23 coefficients, similar to our original linear regression model from Part I.  Since for the sake of efficiency, we used MCMC to search the model space, there is no guarantee that we found the absolute best model, but of those searched, this "best" model has by far the highest posterior probability (0.2173).
+
+### Model Testing
+
+To verify whether our BMA performs well both in-sample and out-of-sample, we used 5-fold cross-validation on the training set to compute the average RMSE and coverage across all folds.  Below are the results for the BMA, BPM, and HPM estimators:
+
+```{r subset and split}
+## SUBSET HOW YOU WANT HERE
+full_train <- paintings_train %>%
+  # select manually the most important predictors
+  select(logprice, Surface, year,
+         Interm, engraved, prevcoll, finished,
+         lrgfont, lands_sc, portrait, still_life,
+         discauth, artistliving,
+         dealer, origin_author)
+
+# Splits into k folds
+set.seed(100)
+shuffled_rows <- sample(1:nrow(full_train))
+k <- 5
+folds <- split(shuffled_rows, sort(shuffled_rows %% k)) 
+```
+
+```{r bma cv, cache = T}
+## DO YOUR MODELING HERE
+bma_cv <- as.list(rep(NA, k))
+for (i in 1:k) {
+  train <- full_train[-folds[[i]],] %>% impute_NA()
+  
+  bma_cv[[i]] <- bas.lm(logprice ~ . - Surface + log(Surface) +
+                          year:discauth + year:artistliving + Interm:discauth +
+                          Interm:dealer + prevcoll:finished + discauth:dealer,
+                        data = train,
+                        prior = "g-prior",
+                        alpha = nrow(train),
+                        modelprior = uniform(),
+                        method = "MCMC")
+}
+```
+
+```{r cv analysis functions}
+rmse <- function(obs, pred) {
+    sqrt(sum((obs - pred)^2)/length(obs))
+}
+
+cv <- function(full_train, folds, est) {
+  
+  null_train <- null_test <- train_rmse <- test_rmse <- train_covg <- test_covg <- rep(NA, k)
+  for (i in 1:k) {
+    
+    test <- full_train[folds[[i]],] %>% impute_NA()
+    train <- full_train[-folds[[i]],] %>% impute_NA()
+    
+    predict_train <- predict(bma_cv[[i]], newdata = train, estimator = est, se.fit = TRUE)
+    predict_test <- predict(bma_cv[[i]], newdata = test, estimator = est, se.fit = TRUE)
+    # Get prediction intervals into a dataframe like this
+    pi_train <- data.frame(confint(predict_train, parm = "pred")[1:nrow(train),])
+    pi_test <- data.frame(confint(predict_test, parm = "pred")[1:nrow(test),])
+    
+    # Compare BMA RMSE to a baseline
+    null_train[i] <- rmse(exp(train$logprice), exp(predict(lm(logprice ~ 1, data = train))))
+    null_test[i] <- rmse(exp(test$logprice), exp(predict(lm(logprice ~ 1, data = test))))
+    
+    train_rmse[i] <- rmse(exp(train$logprice), exp(pi_train$pred))
+    train_covg[i] <- mean(exp(train$logprice) > exp(pi_train[,1]) &
+                          exp(train$logprice) < exp(pi_train[,2]) )
+    
+    test_rmse[i] <- rmse(exp(test$logprice), exp(pi_test$pred))
+    test_covg[i] <- mean(exp(test$logprice) > exp(pi_test[,1]) &
+                         exp(test$logprice) < exp(pi_test[,2]))
+  }
+  
+  cv_analysis <- cbind(null_train, train_rmse, train_covg,
+                       null_test, test_rmse, test_covg) %>%
+    rbind(average = apply(., MARGIN = 2, mean))
+  
+  return(cv_analysis)
+}
+```
+
+```{r cv for different estimators}
+kable(cv(full_train, folds, "BMA"), digits = 3, caption = "k-fold CV for final model (BMA estimator)")
+kable(cv(full_train, folds, "HPM"), digits = 3, caption = "k-fold CV for final model (HPM estimator)")
+kable(cv(full_train, folds, "BPM"), digits = 3, caption = "k-fold CV for final model (BPM estimator)")
+```
+
+All 3 estimators seem to give similar results.  This should be expected, as one model has a very high posterior probability, making BMA close to selection of the highest-posterior model.  Based on these results, we decide to just use the HPM to make predictions, as it seems to perform the best of the three estimators on out-of-sample observations and as mentioned, it is naturally very close to the BMA estimates.
+
+The highest-posterior model performs consistently well across all folds in both RMSE and coverage.  It always does better than the null model and with the exception of the final fold, performs as well or better on the test set than on the training set.  Of the different BMA models we fitted, we found that this final model has relatively low variance in test RMSE and on average, has the lowest test RMSE.  Other models (e.g., one which used the same coefficients but treated `year` as a factor) performs better on the test set leaderboard (1232 RMSE instead of the current 1282 RMSE) but due to high variance, is much worse in cross-validation. Since we do not know how our performance on the validation set, we decide to choose the more consistent and stable model, despite the slightly lower score on the test set.
+
+### Top 10 Paintings
+
+```{r top ten}
+paintings_validation %>%
+  impute_NA() %>%
+  mutate(predict_price = exp(predict(bma, newdata = ., estimator = "HPM")$fit)) %>%
+  arrange(desc(predict_price)) %>%
+  slice(1:10) %>%
+  select(predict_price, author, subject) %>%
+  mutate_at(c("author", "subject"), function(x) { str_replace_all(x, "[^\\w\\s\\d]", "") }) %>%
+  kable(digits = 2, caption = "Top 10 valued paintings in validation set")
+```
+
+Our model selects the above works as the top 10 most expensive paintings in the validation set.  The second and third artists on this list are Rembrandt and Peter Paul Rubens, respectively, perhaps the two most well-regarded artists of the 17th century Dutch Golden Age.  In particular, the second painting is "The Night Watch," Rembrandt's most famous painting and one of the most famous of that entire century.  Jardin is less well-known nowadays, but since these paintings were bought in the late 18th century, it is possible his reputation was better at the time.  Regardless, these results seem to make sense, suggesting that our model is giving reasonable results on out-of-sample predictions (at least at the high end of the price spectrum).
+
+
+## **Conclusion**
+
+<!--- 6. Conclusion (10 points): must include a summary of results and a discussion of things learned. Optional what would you do if you had more time. --->   
+
+It seems like the factors that drove painting prices in 18th century Paris are mostly related to the sale and the dealer, the attributes of the painter and the year the sale took place. Only a few elements that relate to the actual content of the painting remained in our final model. The circumstances of the sale, therefore, have a higher prediction power than the subject that shows up in the painting. This outcome is not very surprising, and one would postulate that this is not a feature unique to pre-industrial France, but a persisting feature of the art world to this day.
+
+Our modelling efforts included multiple trial and error on variable selection and modelling technique. We learned from this experiment that variables that seem to perform very well in the training data can result in overfitting the model when applied to out-of-sample data. For example, we found out that the year variable performs well in the test data when it is viewed as a categorical variable. But when performing k-fold cross-validation, it seemed to bring instability to our model with high variance in RMSE. When we included it as a numeric value (therefore considering a linear relationship with log price) the out-of-sample results got much better results. In addition, once the basic model is decided, using more advanced techniques such as BMA does not necessarily result in better predictions. 
+
+If we had more time, we would consider other modelling techniques such as BART, and also experiment more with other variables. For example, possibly applying vectorization of the content strings and identifying imporant attributes. Also, we would experiment with dimensionality reduction of the dummy variables before including them in the models, to see if more information could be drawn from them. Finally, we would have executed multiple imputation with `mice`.
+
+## **Final Predictions**
+
+```{r predict train, echo=FALSE, eval=FALSE}
+predictions = as.data.frame(
+  exp(confint(predict(bma, newdata = raw_paintings_train %>%
+                        preprocess(rm_dup = F) %>% impute_NA(), 
+              estimator = "HPM", se.fit = T), parm = "pred")[1:nrow(paintings_train),])
+) %>%
+  select(fit = 3, lwr = 1, upr = 2)
+save(predictions, file="predict-train.Rdata")
+```
+
+<!-- TEST SET -->
+
+```{r predict test, echo=FALSE, eval=FALSE}
+predictions = as.data.frame(
+  exp(confint(predict(bma, newdata = paintings_test %>% impute_NA(), 
+              estimator = "HPM", se.fit = T), parm = "pred")[1:nrow(paintings_test),])
+) %>%
+  select(fit = 3, lwr = 1, upr = 2)
+save(predictions, file="predict-test.Rdata")
+```
+
+<!-- VALIDATION SET:
+Create predictions for the validation data from your final model using the dataframe `paintings_validation.Rdata` in your repo.  You may refit your final model to the combined training and test data.  Write predictions out to a file `prediction-validation.Rdata`
+*This should have the same format as the model output in Part I and II!* -->
+
+```{r prediction validation, echo=FALSE, eval=FALSE}
+predictions = as.data.frame(
+  exp(confint(predict(bma, newdata = paintings_validation %>% impute_NA(), 
+              estimator = "HPM", se.fit = T), parm = "pred")[1:nrow(paintings_validation),])
+) %>%
+  select(fit = 3, lwr = 1, upr = 2)
+save(predictions, file="predict-validation.Rdata")
+```
+
+
+
+

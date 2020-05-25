@@ -1,0 +1,25 @@
+box: merliseclyde/predictive-modeling
+
+build:
+  steps:
+    - script:
+      name: Setup
+      code: |
+          apt-get install libsasl2-dev
+          install2.r mongolite
+    - script:
+      name: Final scores
+      code: |
+          wget --quiet --no-check-certificate http://www.stat.duke.edu/courses/Fall19/sta521/Final_Project_Scoring/Final_Scoring.R
+          Rscript Final_Scoring.R $TEAM $MONGO_URL $TESTDATA_URL
+    - script:
+      name: Validation Check
+      code: |
+          wget --quiet --no-check-certificate http://www.stat.duke.edu/courses/Fall19/sta521/Final_Project_Scoring/Validation_Check.R
+          Rscript Validation_Check.R $TEAM $MONGO_URL $VALDATA_URL
+    - script:
+      name: Validation Scoring
+      code: |
+          wget --quiet --no-check-certificate http://www.stat.duke.edu/courses/Fall19/sta521/Final_Project_Scoring/Validation_Scoring.R
+          Rscript Validation_Scoring.R $TEAM $MONGO_URL $VALDATA_URL
+
